@@ -1527,7 +1527,6 @@ class Matmul:
         self.preferences = preferences
 
         mm_traits = self.mm_traits
-
         stream_holder = utils.get_or_create_stream(self.device_id, stream, self.package)
         self.logger.info(f"The specified stream for the matrix multiplication plan is {stream_holder.obj}.")
 
@@ -1916,6 +1915,7 @@ class Matmul:
         # Create the map from object to buffer.
         self.algorithm_object_to_buffer = dict(zip(self.algorithm_objects, self.algorithms_buffer, strict=True))
 
+        breakpoint()
         self.workspace_size = int(np.max(self.algorithms_buffer["workspace_size"]))
         if self.workspace_size > 0 and self.epilog:
             self.workspace_size += 16  # Workaround for library issue

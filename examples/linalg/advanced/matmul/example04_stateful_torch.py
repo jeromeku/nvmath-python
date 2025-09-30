@@ -12,6 +12,13 @@ The inputs as well as the result are PyTorch tensors on the GPU.
 import torch
 
 import nvmath
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s::%(levelname)s::%(pathname)s:%(lineno)d: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 # Prepare sample input data
 device_id = 0

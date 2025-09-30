@@ -1,0 +1,161 @@
+# Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. ALL RIGHTS RESERVED.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+This example illustrates the use of stateful matrix multiplication objects. Stateful objects
+amortize the cost of preparation across multiple executions.
+
+The inputs as well as the result are PyTorch tensors on the GPU.
+"""
+
+import torch
+
+import nvmath
+import logging
+from cuda.core.experimental import Device
+from nvmath.bindings import cublasLt as cublaslt
+from nvmath.linalg._internal import matmul_desc_ifc, matmul_pref_ifc, matrix_layout_ifc
+from nvmath.linalg._internal.utils import get_handle, pointer_aligned_to
+from nvmath.internal.utils import package_wrapper, get_memory_limit_from_device_id
+from nvmath.bindings.cublas import Operation, ComputeType
+from nvmath.linalg._internal.typemaps import cudaDataType, SCALE_TYPE_TO_DEFAULT_COMPUTE_TYPE
+from nvmath.linalg.advanced import MatmulPlanPreferences, MatmulOptions
+from nvmath.linalg._internal import algo_cap_ifc, algo_config_ifc
+from nvmath.linalg.advanced import _algorithmmod
+
+import numpy as np
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s::%(levelname)s:: %(pathname)s:%(lineno)d: %(message)s",
+    datefmt="%H:%M:%S",
+)
+pt_stream = torch.cuda.current_stream()
+print(f"PyTorch stream: {pt_stream}")
+
+def create_mm_desc(compute_type: ComputeType, scale_type: cudaDataType):
+    mm_desc = cublaslt.matmul_desc_create(compute_type, scale_type)
+
+    mm_desc_ifc = matmul_desc_ifc.MatmulDescInterface(mm_desc)
+    mm_desc_ifc.compute_type = compute_type
+    mm_desc_ifc.scale_type = scale_type
+    
+    return mm_desc, mm_desc_ifc
+
+
+# Create a wrapper class that implements __cuda_stream__
+class PyTorchStreamWrapper:
+    def __init__(self, pt_stream):
+        self.pt_stream = pt_stream
+
+    def __cuda_stream__(self):
+        stream_id = self.pt_stream.cuda_stream
+        return (0, stream_id)  # Return format required by CUDA Python
+
+
+# Prepare sample input data
+device_id = 0
+bs, seqlen, d = 8, 4096, 2048
+dtype = torch.bfloat16
+A = torch.rand(bs, seqlen, d, device=device_id, dtype=dtype)
+B = torch.rand(d, d, device=device_id, dtype=dtype)
+D = torch.empty(bs, d, seqlen, dtype=dtype, device=device_id)
+_dtype = cudaDataType.CUDA_R_16BF
+ALIGNMENT_BYTES = 256
+
+# Use the stateful object as a context manager to automatically release resources.
+mm = nvmath.linalg.advanced.Matmul(A, B)
+assert mm.compute_type == ComputeType.COMPUTE_32F
+assert mm.scale_type == cudaDataType.CUDA_R_32F
+
+# desc_ifc = mm.mm_desc_ifc
+# Create handle
+lt_handle = get_handle(device_id=device_id)
+desc, desc_ifc = create_mm_desc(mm.compute_type, mm.scale_type)
+assert desc_ifc.matmul_desc == desc
+desc_ifc.TRANSA = Operation.N
+desc_ifc.TRANSB = Operation.N
+
+ldA = A.shape[-1]
+batch_offset_A = A.stride(0)
+assert ldA == d
+
+ldB = B.shape[-1]
+batch_offset_B = 0
+
+ldD = D.shape[-1]
+assert ldD == seqlen
+batch_offset_D = D.stride(0)
+a_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=seqlen, cols=d, ld=ldA)
+b_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=d, cols=d, ld=ldB)
+
+d_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=seqlen, cols=d, ld=ldD) # Note D will be COL_MAJOR hence will be transposed
+c_layout_ptr = d_layout_ptr # reuse since no C
+
+layout_a_ifc = matrix_layout_ifc.MatrixLayoutInterface(a_layout_ptr)
+layout_a_ifc.order = cublaslt.Order.ROW
+layout_a_ifc.batch_count = bs
+layout_a_ifc.batch_offset = batch_offset_A
+
+layout_b_ifc = matrix_layout_ifc.MatrixLayoutInterface(b_layout_ptr)
+layout_b_ifc.order = cublaslt.Order.ROW
+layout_b_ifc.batch_count = 8
+layout_b_ifc.batch_offset = batch_offset_B
+
+layout_d_ifc = matrix_layout_ifc.MatrixLayoutInterface(d_layout_ptr)
+layout_d_ifc.order = cublaslt.Order.COL
+layout_d_ifc.batch_count = 8
+layout_d_ifc.batch_offset = batch_offset_D
+
+options = MatmulOptions()
+
+limit = 8
+preferences = MatmulPlanPreferences(limit=limit)
+algorithms_buffer = cublaslt.MatmulHeuristicResult(limit)
+num_algorithms = np.empty((1,), dtype=np.int32)
+
+preference_ptr = cublaslt.matmul_preference_create()
+preference_ifc = matmul_pref_ifc.MatmulPreferenceInterface(preference_ptr)
+memory_limit = r"80%"
+preference_ifc.max_workspace_bytes = get_memory_limit_from_device_id(memory_limit, device_id)
+preference_ifc.reduction_scheme_mask = preferences.reduction_scheme_mask
+preference_ifc.max_waves_count = preferences.max_waves_count
+preference_ifc.impl_mask = preferences.numerical_impl_mask
+ALIGNMENT_A = min(ALIGNMENT_BYTES, pointer_aligned_to(A.data_ptr()))
+ALIGNMENT_B = min(ALIGNMENT_BYTES, pointer_aligned_to(B.data_ptr()))
+cublaslt.matmul_algo_get_heuristic(
+    lt_handle,
+    desc,
+    a_layout_ptr,
+    b_layout_ptr,
+    c_layout_ptr,
+    d_layout_ptr,
+    preference_ptr,
+    limit,
+    algorithms_buffer.ptr,
+    num_algorithms.ctypes.data,
+)
+num_algorithms = num_algorithms[0]
+
+assert num_algorithms > 0, "No valid algos"
+algorithms_buffer = algorithms_buffer[:num_algorithms]
+cached_best_algorithm_struct = algorithms_buffer[0]["algo"]
+workspace_size = int(np.max(algorithms_buffer["workspace_size"]))
+algorithm_objects = tuple(_algorithmmod.Algorithm(a) for a in algorithms_buffer)
+# algo = algorithm_objects[0]
+# algo.tile, algo.cta_swizzling, algo.custom_option...
+
+# Plan the matrix multiplication. Planning returns a sequence of algorithms that can be
+# configured, as we'll see in a later example.
+breakpoint()
+mm.plan()
+
+# # Execute the matrix multiplication.
+# result = mm.execute()
+
+# # Synchronize the default stream, since by default the execution is non-blocking for GPU
+# # operands.
+# torch.cuda.default_stream().synchronize()
+# print(f"Input types = {type(a), type(b)}, device = {a.device, b.device}")
+# print(f"Result type = {type(result)}, device = {result.device}")
