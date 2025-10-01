@@ -10,7 +10,7 @@ The inputs as well as the result are PyTorch tensors on the GPU.
 """
 
 import torch
-
+import sys
 import nvmath
 import logging
 from cuda.core.experimental import Device
@@ -31,8 +31,7 @@ logging.basicConfig(
     format="%(asctime)s::%(levelname)s:: %(pathname)s:%(lineno)d: %(message)s",
     datefmt="%H:%M:%S",
 )
-pt_stream = torch.cuda.current_stream()
-print(f"PyTorch stream: {pt_stream}")
+current_stream = torch.cuda.current_stream()
 
 def create_mm_desc(compute_type: ComputeType, scale_type: cudaDataType):
     mm_desc = cublaslt.matmul_desc_create(compute_type, scale_type)
@@ -56,16 +55,21 @@ class PyTorchStreamWrapper:
 
 # Prepare sample input data
 device_id = 0
-bs, seqlen, d = 8, 4096, 2048
+bs, seqlen, d = 2, 4096, 2048
 dtype = torch.bfloat16
 A = torch.rand(bs, seqlen, d, device=device_id, dtype=dtype)
 B = torch.rand(d, d, device=device_id, dtype=dtype)
 D = torch.empty(bs, d, seqlen, dtype=dtype, device=device_id)
+alpha = np.zeros((1,), dtype=np.float32)
+alpha[0] = 1
+beta = np.zeros((1,), dtype=np.float32)
+
 _dtype = cudaDataType.CUDA_R_16BF
 ALIGNMENT_BYTES = 256
 
 # Use the stateful object as a context manager to automatically release resources.
 mm = nvmath.linalg.advanced.Matmul(A, B)
+
 assert mm.compute_type == ComputeType.COMPUTE_32F
 assert mm.scale_type == cudaDataType.CUDA_R_32F
 
@@ -87,29 +91,37 @@ batch_offset_B = 0
 ldD = D.shape[-1]
 assert ldD == seqlen
 batch_offset_D = D.stride(0)
+
 a_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=seqlen, cols=d, ld=ldA)
 b_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=d, cols=d, ld=ldB)
 
 d_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=seqlen, cols=d, ld=ldD) # Note D will be COL_MAJOR hence will be transposed
-c_layout_ptr = d_layout_ptr # reuse since no C
+
+c_layout_ptr = cublaslt.matrix_layout_create(_dtype, rows=seqlen, cols=d, ld=ldD)
+# c_layout_ptr = d_layout_ptr # reuse since no C
 
 layout_a_ifc = matrix_layout_ifc.MatrixLayoutInterface(a_layout_ptr)
 layout_a_ifc.order = cublaslt.Order.ROW
 layout_a_ifc.batch_count = bs
-layout_a_ifc.batch_offset = batch_offset_A
+layout_a_ifc.strided_batch_offset = batch_offset_A
 
 layout_b_ifc = matrix_layout_ifc.MatrixLayoutInterface(b_layout_ptr)
 layout_b_ifc.order = cublaslt.Order.ROW
-layout_b_ifc.batch_count = 8
-layout_b_ifc.batch_offset = batch_offset_B
+layout_b_ifc.batch_count = bs
+layout_b_ifc.strided_batch_offset = batch_offset_B
 
 layout_d_ifc = matrix_layout_ifc.MatrixLayoutInterface(d_layout_ptr)
 layout_d_ifc.order = cublaslt.Order.COL
-layout_d_ifc.batch_count = 8
-layout_d_ifc.batch_offset = batch_offset_D
+layout_d_ifc.batch_count = bs
+layout_d_ifc.strided_batch_offset = batch_offset_D
 
+layout_c_ifc = matrix_layout_ifc.MatrixLayoutInterface(c_layout_ptr)
+layout_c_ifc.order = cublaslt.Order.COL
+layout_c_ifc.batch_count = bs
+layout_c_ifc.strided_batch_offset = batch_offset_D
+
+breakpoint()
 options = MatmulOptions()
-
 limit = 8
 preferences = MatmulPlanPreferences(limit=limit)
 algorithms_buffer = cublaslt.MatmulHeuristicResult(limit)
@@ -124,6 +136,7 @@ preference_ifc.max_waves_count = preferences.max_waves_count
 preference_ifc.impl_mask = preferences.numerical_impl_mask
 ALIGNMENT_A = min(ALIGNMENT_BYTES, pointer_aligned_to(A.data_ptr()))
 ALIGNMENT_B = min(ALIGNMENT_BYTES, pointer_aligned_to(B.data_ptr()))
+
 cublaslt.matmul_algo_get_heuristic(
     lt_handle,
     desc,
@@ -140,22 +153,36 @@ num_algorithms = num_algorithms[0]
 
 assert num_algorithms > 0, "No valid algos"
 algorithms_buffer = algorithms_buffer[:num_algorithms]
-cached_best_algorithm_struct = algorithms_buffer[0]["algo"]
+best_algorithm_struct = algorithms_buffer[0]["algo"]
 workspace_size = int(np.max(algorithms_buffer["workspace_size"]))
 algorithm_objects = tuple(_algorithmmod.Algorithm(a) for a in algorithms_buffer)
-# algo = algorithm_objects[0]
-# algo.tile, algo.cta_swizzling, algo.custom_option...
+workspace = torch.empty((workspace_size,), dtype=torch.uint8, device=device_id)
 
-# Plan the matrix multiplication. Planning returns a sequence of algorithms that can be
-# configured, as we'll see in a later example.
-breakpoint()
-mm.plan()
+cublaslt.matmul(
+    lt_handle,
+    desc,
+    alpha.ctypes.data,
+    A.data_ptr(),
+    a_layout_ptr,
+    B.data_ptr(),
+    b_layout_ptr,
+    beta.ctypes.data,
+    0,
+    c_layout_ptr,
+    D.data_ptr(),
+    d_layout_ptr,
+    best_algorithm_struct.ctypes.data,
+    workspace.data_ptr(),
+    workspace_size,
+    current_stream.cuda_stream,
+)
+current_stream.synchronize()
+ref = (A @ B).transpose(1, 2).contiguous()
+EXPECTED_SHAPE = torch.Size([bs, d, seqlen])
+assert ref.shape == EXPECTED_SHAPE
+assert D.shape == EXPECTED_SHAPE
+diff = (ref - D).abs().max()
 
-# # Execute the matrix multiplication.
-# result = mm.execute()
-
-# # Synchronize the default stream, since by default the execution is non-blocking for GPU
-# # operands.
-# torch.cuda.default_stream().synchronize()
-# print(f"Input types = {type(a), type(b)}, device = {a.device, b.device}")
-# print(f"Result type = {type(result)}, device = {result.device}")
+print(f"{diff.item():.4f}")
+print(ref.view(-1)[:10], ref.view(-1)[-10:])
+print(D.view(-1)[:10], D.view(-1)[-10:])

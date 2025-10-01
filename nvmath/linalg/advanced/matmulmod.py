@@ -1233,7 +1233,6 @@ class Matmul:
         """
         Allocate workspace memory using the specified allocator.
         """
-
         assert self.workspace_size is not None, "Internal Error."
         assert self.workspace_allocated_here is False, "Internal Error."
 
@@ -1915,7 +1914,6 @@ class Matmul:
         # Create the map from object to buffer.
         self.algorithm_object_to_buffer = dict(zip(self.algorithm_objects, self.algorithms_buffer, strict=True))
 
-        breakpoint()
         self.workspace_size = int(np.max(self.algorithms_buffer["workspace_size"]))
         if self.workspace_size > 0 and self.epilog:
             self.workspace_size += 16  # Workaround for library issue
